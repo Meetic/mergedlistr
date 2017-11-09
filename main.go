@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/spf13/viper"
-	"github.com/xanzy/go-gitlab"
+	gitlab "github.com/xanzy/go-gitlab"
 )
 
 var (
@@ -21,7 +21,6 @@ var (
 )
 
 func main() {
-
 	setConfig()
 
 	fmt.Println("Searching for PRs...")
@@ -41,7 +40,7 @@ func setConfig() {
 
 	err := viper.ReadInConfig()
 	if err != nil {
-		panic(fmt.Errorf("Fatal error config file: %s \n", err))
+		panic(fmt.Errorf("fatal error config file: %s", err))
 	}
 
 	token = viper.GetString("gitlab-token")
@@ -72,8 +71,9 @@ func print(mergeRequestByProject map[string][]map[string]string) {
 }
 
 func getMergeRequests(git *gitlab.Client, groupToWatch []string, from time.Time) map[string][]map[string]string {
+
 	groupsCh := make(chan *gitlab.Group, len(groupToWatch))
-	projectsCh := make(chan *gitlab.Project, 200)
+	projectsList := map[int]*gitlab.Project{}
 	mu := &sync.Mutex{}
 
 	results := make(map[string][]map[string]string, 500)
@@ -104,58 +104,56 @@ func getMergeRequests(git *gitlab.Client, groupToWatch []string, from time.Time)
 		wgp.Add(1)
 		go func(g *gitlab.Group) {
 			//Find all projects
-			projects, _, err := git.Groups.ListGroupProjects(g.ID, &gitlab.ListGroupProjectsOptions{})
+			projects, _, err := git.Groups.ListGroupProjects(g.ID, &gitlab.ListGroupProjectsOptions{
+				gitlab.ListOptions{
+					PerPage: 100,
+				},
+			})
 			if err != nil {
 				log.Fatal(err)
 			}
 
 			for _, p := range projects {
-				projectsCh <- p
+				mu.Lock()
+				projectsList[p.ID] = p
+				mu.Unlock()
 			}
 			wgp.Done()
 		}(g)
 	}
 	wgp.Wait()
-	close(projectsCh)
 
-	var wgmr sync.WaitGroup
-	for p := range projectsCh {
-		wgmr.Add(1)
-		go func(p *gitlab.Project) {
-			//Find all MR merged order by date
-			pageOptions := gitlab.ListOptions{
-				PerPage: 30,
-			}
-			mrOptions := &gitlab.ListMergeRequestsOptions{
-				ListOptions: pageOptions,
-				State:       gitlab.String("merged"),
-				OrderBy:     gitlab.String("updated_at"),
-			}
-
-			mergeRequests, _, err := git.MergeRequests.ListMergeRequests(p.ID, mrOptions)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			for _, mr := range mergeRequests {
-				if mr.UpdatedAt.After(from) {
-					mr := map[string]string{
-						"projectName": p.Name,
-						"title":       mr.Title,
-						"mergedAt":    mr.UpdatedAt.Format(time.RFC3339),
-						"createdBy":   mr.Author.Name,
-					}
-
-					mu.Lock()
-					results[mr["projectName"]] = append(results[mr["projectName"]], mr)
-					mu.Unlock()
-				}
-			}
-			wgmr.Done()
-		}(p)
+	pageOptions := gitlab.ListOptions{
+		PerPage: 100,
 	}
 
-	wgmr.Wait()
+	mrOptions := &gitlab.ListMergeRequestsOptions{
+		ListOptions: pageOptions,
+		State:       gitlab.String("merged"),
+		OrderBy:     gitlab.String("updated_at"),
+		Scope:       gitlab.String("all"),
+	}
+
+	mergeRequests, _, err := git.MergeRequests.ListMergeRequests(mrOptions)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, mr := range mergeRequests {
+		if p, ok := projectsList[mr.ProjectID]; ok {
+			if mr.UpdatedAt.After(from) {
+				mr := map[string]string{
+					"projectName": p.Name,
+					"title":       mr.Title,
+					"mergedAt":    mr.UpdatedAt.Format(time.RFC3339),
+					"createdBy":   mr.Author.Name,
+				}
+
+				results[mr["projectName"]] = append(results[mr["projectName"]], mr)
+			}
+		}
+	}
 
 	return results
 }
