@@ -40,7 +40,7 @@ func setConfig() {
 
 	err := viper.ReadInConfig()
 	if err != nil {
-		panic(fmt.Errorf("fatal error config file: %s", err))
+		log.Fatalf(("fatal error config file: %s", err)
 	}
 
 	token = viper.GetString("gitlab-token")
