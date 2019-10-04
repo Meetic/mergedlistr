@@ -94,7 +94,7 @@ func print(mergeRequestByProject map[string][]map[string]string) {
 	fmt.Fprintln(w, "Project\tMerge Request\tDate\tAuthor")
 	for p, mrs := range mergeRequestByProject {
 		for _, mr := range mrs {
-			fmt.Fprintf(w, fmt.Sprintf("%s\t%s\t%s\t%s\t%s", p, mr["title"], mr["mergedAt"], mr["createdBy"]))
+			fmt.Fprintf(w, fmt.Sprintf("%s\t%s\t%s\t%s", p, mr["title"], mr["mergedAt"], mr["createdBy"]))
 			fmt.Fprintln(w)
 		}
 	}
