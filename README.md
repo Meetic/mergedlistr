@@ -4,19 +4,20 @@ Mergedlistr is a gitlab cli tool that list all merge request that have been merg
 
 ## Requirements
 
-* Gitlab API v3
+* Gitlab API v4
 
 This tool is using the version 3 of the Gitlab API.
 
 ## Usage
 
 ```sh
-mergedlistr -t 24h
+mergedlistr -f 2019-09-10 -t 2019-09-15
 ```
 
-Will output all merge requests merged during the last 24 hours.
+Will output all merge requests merged between date 2019-09-10 and 2019-09-15.
 
-If no duration is specified, the default value is 24h.
+If no duration is specified, the default from date is yesterday and to date is tomorrow. This way,
+it returns all the merge request merged during yesterday and the current day.
 
 ## Installation
 
@@ -30,7 +31,7 @@ Example of configuration :
 
 ```yaml
 gitlab-token: "{your_token}"
-gitlab-url: "{your_gitlab_url}/api/v3/"
+gitlab-url: "{your_gitlab_url}/api/v4/"
 groups:
   - "group1"
   - "group2"
