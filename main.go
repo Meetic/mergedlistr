@@ -3,11 +3,12 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"sync"
 	"text/tabwriter"
 	"time"
+	"github.com/sirupsen/logrus"
 
 	"github.com/spf13/viper"
 	gitlab "github.com/xanzy/go-gitlab"
@@ -18,19 +19,38 @@ var (
 	gitlabURL string
 	groups    []string
 	fromDate  time.Time
+	untilDate time.Time
 )
 
 func main() {
 	setConfig()
 
-	fmt.Println("Searching for PRs...")
+	logrus.Infof("Looking for MRs between %s and %s...", fromDate.Format("2006-01-02"), untilDate.Format("2006-01-02"))
 
 	//Init Gitlab client
 	git := gitlab.NewClient(nil, token)
-	git.SetBaseURL(gitlabURL)
+	if err := git.SetBaseURL(gitlabURL); err != nil {
+		logrus.Fatalf("Error when setting gitlab base URL : %s", err.Error())
+	}
 
-	print(getMergeRequests(git, groups, fromDate))
+	print(findMergeRequest(git, groups, fromDate, untilDate))
 
+}
+
+//setUpLogs set on writer as output for the logs and set up the level
+func setUpLogs(out io.Writer, level string) error {
+
+	logrus.SetOutput(out)
+	lvl, err := logrus.ParseLevel(level)
+	if err != nil {
+		return err
+	}
+	logrus.SetLevel(lvl)
+	logrus.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+	})
+	return nil
 }
 
 func setConfig() {
@@ -40,18 +60,30 @@ func setConfig() {
 
 	err := viper.ReadInConfig()
 	if err != nil {
-		log.Fatalf(("fatal error config file: %s", err)
+		logrus.Fatalf("fatal error config file: %s", err)
 	}
 
 	token = viper.GetString("gitlab-token")
 	gitlabURL = viper.GetString("gitlab-url")
 	groups = viper.GetStringSlice("groups")
 
-	var duration time.Duration
-	flag.DurationVar(&duration, "t", 24*time.Hour, `Duration to look for merges PRs. Example :  "-t 24h", "-t 15m", or "-t 30s"`)
+	//var duration time.Duration
+	var fDate string
+	var tDate string
+	var verbosity string
+
+	flag.StringVar(&fDate, "f", time.Now().AddDate(0, 0, -1).Format("2006-01-02") , `From date to look for merged PRs. Format is : "-f YYYY-MM-DD"`)
+	flag.StringVar(&tDate, "t", time.Now().Format("2006-01-02") , `To date to look for merged PRs. Format is : "-t YYYY-MM-DD"`)
+	flag.StringVar(&verbosity, "v", logrus.InfoLevel.String(), "Log level (debug, info, warn, error, fatal, panic")
 	flag.Parse()
 
-	fromDate = time.Now().Add(-duration)
+	fromDate, _ = time.Parse("2006-01-02", fDate)
+	untilDate, _ = time.Parse("2006-01-02", tDate)
+	untilDate = untilDate.AddDate(0, 0, 1)
+
+	if err := setUpLogs(os.Stdout, verbosity); err != nil {
+		logrus.Fatal(err.Error())
+	}
 
 }
 
@@ -59,10 +91,10 @@ func print(mergeRequestByProject map[string][]map[string]string) {
 	//Init writer
 	w := new(tabwriter.Writer)
 	w.Init(os.Stdout, 0, 8, 0, '\t', 0)
-	fmt.Fprintln(w, "Project\tMerge Request\tDate\tAuthor\t")
+	fmt.Fprintln(w, "Project\tMerge Request\tDate\tAuthor")
 	for p, mrs := range mergeRequestByProject {
 		for _, mr := range mrs {
-			fmt.Fprintf(w, fmt.Sprintf("%s\t%s\t%s\t%s\t", p, mr["title"], mr["mergedAt"], mr["createdBy"]))
+			fmt.Fprintf(w, fmt.Sprintf("%s\t%s\t%s\t%s\t%s", p, mr["title"], mr["mergedAt"], mr["createdBy"]))
 			fmt.Fprintln(w)
 		}
 	}
@@ -70,15 +102,12 @@ func print(mergeRequestByProject map[string][]map[string]string) {
 	w.Flush()
 }
 
-func getMergeRequests(git *gitlab.Client, groupToWatch []string, from time.Time) map[string][]map[string]string {
 
-	groupsCh := make(chan *gitlab.Group, len(groupToWatch))
-	projectsList := map[int]*gitlab.Project{}
-	mu := &sync.Mutex{}
-
-	results := make(map[string][]map[string]string, 500)
+func getGroups(git *gitlab.Client, groupToWatch []string) []*gitlab.Group {
 
 	var wgg sync.WaitGroup
+	mu := &sync.Mutex{}
+	var groups []*gitlab.Group
 	//Get groups to watch
 	for _, gtg := range groupToWatch {
 		wgg.Add(1)
@@ -87,71 +116,144 @@ func getMergeRequests(git *gitlab.Client, groupToWatch []string, from time.Time)
 				Search: gitlab.String(gtg),
 			})
 			if err != nil {
-				log.Fatal(err)
+				logrus.Fatal(err)
+
+			}
+			for _, g := range gs {
+				logrus.Debugf("Found group : %s", g.Name)
 			}
 
-			for _, g := range gs {
-				groupsCh <- g
-			}
+			mu.Lock()
+			groups = append(groups, gs...)
+			mu.Unlock()
 			wgg.Done()
 		}(gtg)
 	}
 	wgg.Wait()
-	close(groupsCh)
 
+	return groups
+}
+
+func getProjects(git *gitlab.Client, groups []*gitlab.Group) []*gitlab.Project{
 	var wgp sync.WaitGroup
-	for g := range groupsCh {
+	mu := &sync.Mutex{}
+	var projects []*gitlab.Project
+
+	for _, g := range groups {
 		wgp.Add(1)
 		go func(g *gitlab.Group) {
+			archived := false
 			//Find all projects
-			projects, _, err := git.Groups.ListGroupProjects(g.ID, &gitlab.ListGroupProjectsOptions{
-				gitlab.ListOptions{
-					PerPage: 100,
+			ps, _, err := git.Groups.ListGroupProjects(g.ID, &gitlab.ListGroupProjectsOptions{
+				//Since we want to avoid recurring across paginated results, we set the pagination very high
+				ListOptions: gitlab.ListOptions{
+					Page: 1,
+					PerPage: 300,
 				},
+				Archived: &archived,
 			})
 			if err != nil {
-				log.Fatal(err)
+				logrus.Fatal(err)
 			}
 
-			for _, p := range projects {
-				mu.Lock()
-				projectsList[p.ID] = p
-				mu.Unlock()
+			for _, p := range ps {
+				logrus.Debugf("Found project %s in group %s", p.Name, g.Name)
 			}
+
+			mu.Lock()
+			projects = append(projects, ps...)
+			mu.Unlock()
+
 			wgp.Done()
 		}(g)
 	}
 	wgp.Wait()
 
-	pageOptions := gitlab.ListOptions{
-		PerPage: 100,
+	return projects
+}
+
+func getMergeRequests(git *gitlab.Client, projects []*gitlab.Project, from, to time.Time) []*gitlab.MergeRequest {
+
+	var wgmr sync.WaitGroup
+	mu := &sync.Mutex{}
+	var mergeRequests []*gitlab.MergeRequest
+
+	//We look for the from date minus 1 day because we gitlab does not offers th ability to filter on Merged At field.
+	//But since merging is considered as an update, we prefer to take a little bit too large and filter on the merge date after.
+	firstUpdatedDate := from.AddDate(0, 0, -1)
+	lastUpdatedDate := to.AddDate(0, 0, 1)
+
+	for _, p := range projects {
+		wgmr.Add(1)
+		go func(p *gitlab.Project) {
+			defer wgmr.Done()
+			logrus.Debugf("Looking for merge request in project : %s", p.Name)
+			mrs, _, err := git.MergeRequests.ListProjectMergeRequests(p.ID, &gitlab.ListProjectMergeRequestsOptions{
+				ListOptions: gitlab.ListOptions{
+					Page: 1,
+					PerPage: 300,
+				},
+				State:       gitlab.String("merged"),
+				OrderBy:     gitlab.String("updated_at"),
+				Scope:       gitlab.String("all"),
+				UpdatedAfter: &firstUpdatedDate,
+				UpdatedBefore: &lastUpdatedDate,
+
+			})
+
+			if err != nil {
+				logrus.Fatal(err)
+			}
+
+			logrus.Debugf("Found %d MR in project %s", len(mrs), p.Name)
+
+			for _, mr := range mrs {
+				logrus.Debugf("Found Merge Request %d titled %s on project %s", mr.ID, mr.Title, p.Name)
+			}
+
+			mu.Lock()
+			mergeRequests = append(mergeRequests, mrs...)
+			mu.Unlock()
+
+
+		}(p)
+	}
+	wgmr.Wait()
+	return mergeRequests
+}
+
+
+func getProjectName(ID int, projects []*gitlab.Project) string {
+
+	for _, p := range projects {
+		if p.ID == ID {
+			return p.Name
+		}
 	}
 
-	mrOptions := &gitlab.ListMergeRequestsOptions{
-		ListOptions: pageOptions,
-		State:       gitlab.String("merged"),
-		OrderBy:     gitlab.String("updated_at"),
-		Scope:       gitlab.String("all"),
-	}
+	return "Unknown Project"
+}
 
-	mergeRequests, _, err := git.MergeRequests.ListMergeRequests(mrOptions)
+func findMergeRequest(git *gitlab.Client, groupToWatch []string, from, to time.Time) map[string][]map[string]string {
+	results := make(map[string][]map[string]string, 500)
 
-	if err != nil {
-		log.Fatal(err)
-	}
+	groups := getGroups(git, groupToWatch)
+	logrus.Debugf("Found %d groups", len(groups))
+	projects := getProjects(git, groups)
+	logrus.Debugf("Found %d projects", len(projects))
+	mergeRequests := getMergeRequests(git, projects, from, to)
 
 	for _, mr := range mergeRequests {
-		if p, ok := projectsList[mr.ProjectID]; ok {
-			if mr.UpdatedAt.After(from) {
-				mr := map[string]string{
-					"projectName": p.Name,
-					"title":       mr.Title,
-					"mergedAt":    mr.UpdatedAt.Format(time.RFC3339),
-					"createdBy":   mr.Author.Name,
-				}
 
-				results[mr["projectName"]] = append(results[mr["projectName"]], mr)
+		if mr.MergedAt.After(from) && mr.MergedAt.Before(to) {
+			mr := map[string]string{
+				"projectName": getProjectName(mr.ProjectID, projects),
+				"title":       mr.Title,
+				"mergedAt":    mr.MergedAt.Format(time.RFC3339),
+				"createdBy":   mr.Author.Name,
+				"link": mr.WebURL,
 			}
+			results[mr["projectName"]] = append(results[mr["projectName"]], mr)
 		}
 	}
 
